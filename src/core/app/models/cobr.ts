@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsNotEmptyObject, IsNumberString, MaxLength, ValidateNested } from "class-validator"
+import { IsIn, IsNotEmpty, Matches, IsNotEmptyObject, IsNumberString, MaxLength, ValidateNested } from "class-validator"
 import { Chave, ICriacao, Expiracao, IInfoAdicional, Pessoa, PixID, ModalidadeAlteracao, Situacao, PixRevisao, Vencimento, DadosPessoa, DadosConta } from "../models"
 import { Type } from "class-transformer"
 import { IntersectionType } from '@nestjs/swagger';
@@ -11,6 +11,7 @@ Todos os campos que indicam valores monetários obedecem ao pattern \d{1,10}.\d{
 export class Valor {
     @IsNotEmpty({ message: 'O campo $$ não respeita o schema.' })
     @IsNumberString({}, { message: 'O campo $$ não respeita o schema.' })
+    @Matches(/^\d{1,10}\.\d{2}$/, { message: 'O campo $$ não respeita o schema.' })
     @MinStringNumber(0.01, { message: 'O campo $$ é zero.' })
     original: string
 }
@@ -27,30 +28,42 @@ export class Retirada {
 
 export enum StatusCobR{
     Aprovada = "APROVADA",
+    Ativa = "ATIVA",
     Cancelada = "CANCELADA",
+    Concluida = "CONCLUIDA",
     Criada = "CRIADA",
     Expirada = "EXPIRADA",
     Rejeitada = "REJEITADA"
 }
 
+export enum TipoTentativaCobR {
+    Agendamento = "AGENDAMENTO",
+    Retentativa = "RETENTATIVA"
+}
 
-export class CobRGetResponse implements  PixID {
-    idrec: string
+export class TentativaCobR {
+    tipo: TipoTentativaCobR
+    dataLiquidacao: string
+    status: "SOLICITADA"
+    criacao: string
+}
+
+
+export class CobRGetResponse implements PixID, PixRevisao {
+    idRec: string
     txid: string
-
-    calendario: {
-        dataCriacao: string,
-        dataVencimento: string
-    }
-    valor:string
+    revisao: number
+    criacao: string
+    infoAdicional: string
+    calendario: Vencimento
+    valor: Valor
     status: StatusCobR
     politicaRetentativa: PoliticaRetentativa
-    
+    dadosDevedor: DadosPessoa
+    contaRecebedor: DadosConta
+    tentativas: TentativaCobR[]
     loc: LocGetRequest
     location: string
-    devedor: Pessoa
-    solicitacaoPagador: string
-    infoAdicionais: IInfoAdicional[]
 }
 
 export class CobRValor extends IntersectionType(Valor, Alteracao, Retirada)
@@ -69,6 +82,11 @@ export class CobRPutRequest {
     @Type(() => Vencimento)
     calendario: Vencimento
 
+    /** Quando ausente, assume o valor da recorrência (rec.valor.valorRec). */
+    @ValidateNested({})
+    @Type(() => Valor)
+    valor?: Valor
+
     @ValidateNested({})
     @Type(() => DadosPessoa)
     dadosDevedor: DadosPessoa
@@ -85,13 +103,15 @@ export class CobRPatchRequest {
     @Type(() => CobRValor)
     valor?: CobRValor
     @ValidateNested()
-    @Type(() => Expiracao)
-    calendario?: Expiracao
+    @Type(() => Vencimento)
+    calendario?: Vencimento
     @ValidateNested({})
-    @Type(() => Pessoa)
-    devedor?: Pessoa
-    solicitacaoPagador?: string
-    status?: "REMOVIDA_PELO_USUARIO_RECEBEDOR"
+    @Type(() => DadosPessoa)
+    dadosDevedor?: DadosPessoa
+    @MaxLength(140, { message: 'O campo $$ não respeita o schema.' })
+    infoAdicional?: string
+    @IsIn([StatusCobR.Cancelada], { message: 'O campo $$ não respeita o schema.' })
+    status?: StatusCobR.Cancelada
 }
 
 export class CobRPatchResponse extends CobRGetResponse {
@@ -138,11 +158,12 @@ export interface ICobRQueryResponse {
 export class CobRGetFilter {
     inicio: string
     fim: string
+    idRec?: string
     @IsCPFValid({ message: 'O campo $$ não respeita o schema.' })
     cpf?: string
     @IsCNPJValid({ message: 'O campo $$ não respeita o schema.' })
     cnpj?: string
     paginacao?: { paginaAtual: number, itensPorPagina: number }
-    status?: Situacao
+    status?: StatusCobR
     locationPresente?: boolean
 }

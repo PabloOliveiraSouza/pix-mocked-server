@@ -157,7 +157,8 @@ export interface IAbatimento extends IAditivo {
 
 export enum TipoCob {
     imediato = "cob",
-    vencimento = "cobv"
+    vencimento = "cobv",
+    recorrencia = "cobr"
 }
 
 

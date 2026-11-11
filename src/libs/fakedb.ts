@@ -1,3 +1,4 @@
+import { BadRequestException, NotFoundException } from "@nestjs/common";
 import { MESSAGES } from "./messages";
 
 export type Dictionary<T> = { [key: string]: T };
@@ -47,7 +48,7 @@ export class MemoryDB {
         
         this.skValidate(data)
         if (await this.read(clusterKey, data)) {
-            throw new Error("Duplicate Key");
+            throw new BadRequestException("Duplicate Key");
         }
         if (!this.cluster[clusterKey]) {
             this.cluster[clusterKey] = [data];
@@ -62,7 +63,7 @@ export class MemoryDB {
         this.skValidate(sortKey)
         let curr = await this.read(clusterKey, sortKey);
         if (!curr) {
-            throw new Error(MESSAGES.Errors.defaults.NOT_FOUNT(this.name));
+            throw new NotFoundException(MESSAGES.Errors.defaults.NOT_FOUNT(this.name));
         }
         else {
             const keys = Object.keys(sortKey);
@@ -78,7 +79,7 @@ export class MemoryDB {
         this.skValidate(data);
         let curr = await this.read(clusterKey, sortKey);
         if (!curr) {
-            throw new Error(MESSAGES.Errors.defaults.NOT_FOUNT(this.name));
+            throw new NotFoundException(MESSAGES.Errors.defaults.NOT_FOUNT(this.name));
         }
         else {
             const keys = Object.keys(sortKey);

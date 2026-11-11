@@ -1,7 +1,7 @@
-import { IsDateString, IsDefined, IsEnum, IsNotEmpty, IsNotEmptyObject, IsNumberString, MaxLength, ValidateNested } from "class-validator"
+import { IsDateString, IsIn, IsOptional, Matches, IsDefined, IsEnum, IsNotEmpty, IsNotEmptyObject, IsNumberString, MaxLength, ValidateNested } from "class-validator"
 import { Pessoa, PixID } from "../models"
 import { Type } from "class-transformer"
-import { MinStringNumber, NotPast } from "../../../validators/custom-validators"
+import { IsCNPJValid, IsCPFValid, MinStringNumber, NotPast } from "../../../validators/custom-validators"
 
 export class Vinculo {
     @IsNotEmpty({ message: 'O campo $$ não respeita o schema.' })
@@ -25,6 +25,7 @@ export enum PoliticaRetentativa {
 export class ValorRecebimento {
     @IsNotEmpty({ message: 'O campo $$ não respeita o schema.' })
     @IsNumberString({}, { message: 'O campo $$ não respeita o schema.' })
+    @Matches(/^\d{1,10}\.\d{2}$/, { message: 'O campo $$ não respeita o schema.' })
     @MinStringNumber(0.01, { message: 'O campo $$ é zero.' })
     valorRec: string
 }
@@ -98,4 +99,50 @@ export class RecPostRequest {
 export class RecRequest<T> {
     IdOwner: string
     data: T
+}
+
+export enum StatusRec {
+    Criada = "CRIADA",
+    Aprovada = "APROVADA",
+    Rejeitada = "REJEITADA",
+    Expirada = "EXPIRADA",
+    Cancelada = "CANCELADA"
+}
+
+export class AtualizacaoRec {
+    status: StatusRec
+    data: string
+}
+
+export class RecGetResponse extends RecPostRequest {
+    idRec: string
+    status: StatusRec
+    atualizacao: AtualizacaoRec[]
+}
+
+export class RecPatchRequest {
+    @IsOptional()
+    @IsIn([StatusRec.Aprovada, StatusRec.Rejeitada, StatusRec.Cancelada], { message: 'O campo $$ não respeita o schema.' })
+    status?: StatusRec.Aprovada | StatusRec.Rejeitada | StatusRec.Cancelada
+
+    @IsOptional()
+    @ValidateNested({})
+    @Type(() => ValorRecebimento)
+    valor?: ValorRecebimento
+
+    @IsOptional()
+    @ValidateNested({})
+    @Type(() => AtivacaoRecorrencia)
+    ativacao?: AtivacaoRecorrencia
+}
+
+export class RecGetFilter {
+    inicio: string
+    fim: string
+    @IsCPFValid({ message: 'O campo $$ não respeita o schema.' })
+    cpf?: string
+    @IsCNPJValid({ message: 'O campo $$ não respeita o schema.' })
+    cnpj?: string
+    status?: StatusRec
+    paginacao?: { paginaAtual: number, itensPorPagina: number }
 }

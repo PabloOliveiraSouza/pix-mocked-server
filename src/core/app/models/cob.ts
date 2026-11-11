@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsNotEmptyObject, IsNumberString, ValidateNested } from "class-validator"
+import { IsNotEmpty, Matches, IsNotEmptyObject, IsNumberString, ValidateNested } from "class-validator"
 import { Chave, ICriacao, Expiracao, IInfoAdicional, Pessoa, PixID, ModalidadeAlteracao, Situacao, PixRevisao } from "../models"
 import { Type } from "class-transformer"
 import { IntersectionType } from '@nestjs/swagger';
@@ -10,6 +10,7 @@ Todos os campos que indicam valores monetários obedecem ao pattern \d{1,10}.\d{
 export class Valor {
     @IsNotEmpty({ message: 'O campo $$ não respeita o schema.' })
     @IsNumberString({}, { message: 'O campo $$ não respeita o schema.' })
+    @Matches(/^\d{1,10}\.\d{2}$/, { message: 'O campo $$ não respeita o schema.' })
     @MinStringNumber(0.01, { message: 'O campo $$ é zero.' })
     original: string
 }

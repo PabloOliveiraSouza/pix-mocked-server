@@ -350,7 +350,7 @@ describe('COBV', () => {
 
       it('Não cadastrado', async () => {
         await request(app.getHttpServer())
-          .patch(`/cobv/${randomUUID()}`)
+          .patch(`/cobv/${randomUUID().replace(/\-/g, '')}`)
           .send({ valor: { original: "2.00" } })
           .set("mocked-token", "123-abc")
           .expect(404)

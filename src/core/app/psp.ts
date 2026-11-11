@@ -1,15 +1,22 @@
-import { Injectable } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { MemoryDB } from "../../libs/fakedb";
 import { PixID, PixKey, PixRequest, TipoCob, Situacao, ModalidadeAlteracao, IPaginator, Expiracao } from "./models";
 import { getMD5Hash } from "../../libs/utils";
 import { randomUUID } from "crypto";
 import { MESSAGES } from "../../libs/messages";
-import { CobGetResponse, CobPatchRequest, CobPutRequest, CobPutResponse, CobGetFilter, CobPatchResponse } from "./models/cob";
+import { CobGetResponse, CobPatchRequest, CobPutRequest, CobPutResponse, CobGetFilter, CobPatchResponse, CobValor } from "./models/cob";
 import { LocGetResponse, LocGetFilter, LocID, LocPutRequest, LocPutResponse } from "./models/loc";
 import { CobVGetFilter, CobVGetResponse, CobVPatchRequest, CobVPatchResponse, CobVPutRequest, CobVPutResponse, CobVValor } from "./models/cobv";
-import { CobRPutRequest, CobRPutResponse } from "./models/cobr";
-import { PoliticaRetentativa, RecPostRequest, RecRequest } from "./models/rec";
+import { CobRGetFilter, CobRGetResponse, CobRPatchRequest, CobRPatchResponse, CobRPutRequest, CobRPutResponse, StatusCobR, TentativaCobR, TipoTentativaCobR } from "./models/cobr";
+import { PoliticaRetentativa, RecGetFilter, RecGetResponse, RecPatchRequest, RecPostRequest, RecRequest, StatusRec } from "./models/rec";
 import { owners } from '../../data/db.json'
+
+type AnyCobGetResponse = CobGetResponse | CobVGetResponse | CobRGetResponse;
+type AnyCobGetFilter = CobGetFilter | CobVGetFilter | CobRGetFilter;
+
+const MAX_RETENTATIVAS = 3;
+const JANELA_RETENTATIVA_DIAS = 7;
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 @Injectable()
 export class PSP {
@@ -39,58 +46,87 @@ export class PSP {
 
     }
 
-    private async joinLocCob(IdOwner: string, txid: string, id: number, tipoCob: TipoCob) {
-        const lc1 = await this.loccob.read(IdOwner, { txid });
-        const lc2 = await this.loccob.read(IdOwner, { id });
+    //COB e COBV compartilham a coleção COB; COBR é persistida em COBR
+    private collection(tipoCob: TipoCob): MemoryDB {
+        return tipoCob === TipoCob.recorrencia ? this.cobR : this.cob;
+    }
 
-        const cob = await this.cob.read(IdOwner, { txid })
+    private editableStatus(tipoCob: TipoCob): string[] {
+        return tipoCob === TipoCob.recorrencia ? [StatusCobR.Criada, StatusCobR.Ativa] : [Situacao.Ativa];
+    }
+
+    private paginate<T>(filter: { inicio: string, fim: string, paginacao?: { paginaAtual: number, itensPorPagina: number } }, items: T[]) {
+        const paginaAtual = Number(filter.paginacao?.paginaAtual) || 0;
+        const itensPorPagina = Number(filter.paginacao?.itensPorPagina) || 100;
+        const ini = paginaAtual * itensPorPagina;
+        const parametros: IPaginator['parametros'] = {
+            inicio: filter.inicio,
+            fim: filter.fim,
+            paginacao: {
+                paginaAtual,
+                itensPorPagina,
+                quantidadeDePaginas: Math.ceil(items.length / itensPorPagina),
+                quantidadeTotalDeItens: items.length
+            }
+        };
+        return { parametros, items: items.slice(ini, ini + itensPorPagina) };
+    }
+
+    private inPeriod(criacao: string, filter: { inicio: string, fim: string }) {
+        const [c, inicio, fim] = [new Date(criacao), new Date(filter.inicio), new Date(filter.fim)];
+        return c >= inicio && c <= fim;
+    }
+
+    private async joinLocCob(IdOwner: string, txid: string, id: number, tipoCob: TipoCob) {
+        const lc2 = await this.loccob.read(IdOwner, { id });
         const loc = await this.locations.read(IdOwner, { id })
 
         if (lc2) {
-            throw new Error('LOCATION JÁ ESTÁ VINCULADO A UMA COBRANÇA');
+            throw new BadRequestException('LOCATION JÁ ESTÁ VINCULADO A UMA COBRANÇA');
         }
-        // if (lc1) {
-        //     throw new Error('COBRANÇA JÁ ESTÁ VINCULADO A UMA LOCATION');
-        // }
-
-        // if (!cob) {
-        //     throw new Error(MESSAGES.Errors.defaults.NOT_FOUNT(TipoCob[tipoCob]));
-        // }
 
         if (!loc) {
-            throw new Error(MESSAGES.Errors.defaults.NOT_FOUNT('location'));
+            throw new BadRequestException(MESSAGES.Errors.defaults.NOT_FOUNT('location'));
         }
 
         if (loc.tipoCob != tipoCob) {
-            throw new Error(MESSAGES.Errors.defaults.UNEXPECTED_VALUE('tipoCob', loc.tipoCob));
+            throw new BadRequestException(MESSAGES.Errors.defaults.UNEXPECTED_VALUE('tipoCob', loc.tipoCob));
         }
 
         await this.loccob.add(IdOwner, { txid, id });
     }
 
-    private async _addCob(itm: PixRequest<CobPutRequest | CobVPutRequest>, tipoCob: TipoCob) {
-        if (itm.data.valor.retirada) {
-            throw new Error('NÃO IMPLEMENTADO');
+    private async _addCob(itm: PixRequest<CobPutRequest | CobVPutRequest | CobRPutRequest>, tipoCob: TipoCob) {
+        const valor = itm.data.valor as CobValor;
+
+        if (valor?.retirada) {
+            throw new BadRequestException('NÃO IMPLEMENTADO: valor.retirada não é suportado por este mock.');
         }
 
-        if (!itm.data.valor.modalidadeAlteracao) {
-            itm.data.valor.modalidadeAlteracao = ModalidadeAlteracao.NaoEditavel;
+        if ((await this.cob?.read(itm.IdOwner, { txid: itm.txid })) || (await this.cobR?.read(itm.IdOwner, { txid: itm.txid }))) {
+            throw new BadRequestException({ txid: 'O campo $$ já foi utilizado por outra cobrança.' });
+        }
+
+        if (valor && !valor.modalidadeAlteracao && tipoCob !== TipoCob.recorrencia) {
+            valor.modalidadeAlteracao = ModalidadeAlteracao.NaoEditavel;
         }
 
         if (tipoCob == TipoCob.imediato) {
-            if (!itm.data.calendario || !(itm.data.calendario as Expiracao)?.expiracao) {
-                itm.data.calendario = { expiracao: 86400 }
+            const data = itm.data as CobPutRequest;
+            if (!data.calendario || !(data.calendario as Expiracao)?.expiracao) {
+                data.calendario = { expiracao: 86400 }
             }
         }
 
-        const curr = { ...itm.data, txid: itm.txid, revisao: 0, status: Situacao.Ativa, criacao: (new Date()).toJSON() };
+        const status = tipoCob === TipoCob.recorrencia ? StatusCobR.Criada : Situacao.Ativa;
+        const curr = { ...itm.data, txid: itm.txid, revisao: 0, status, criacao: (new Date()).toJSON() };
 
         //INCLUI  LOCATION E TRANSAÇÃO, PARA DEPOIS VINCULÁ-LAS  
         const { id } = await this.addLoc({ tipoCob, IdOwner: itm.IdOwner })
-        await this.cob.add(itm.IdOwner, curr);
+        await this.collection(tipoCob).add(itm.IdOwner, curr);
         await this.joinLocCob(itm.IdOwner, itm.txid, id, tipoCob);
 
-        return await this._readCob({ IdOwner: itm.IdOwner, txid: itm.txid });
+        return await this._readCob({ IdOwner: itm.IdOwner, txid: itm.txid }, undefined, tipoCob);
     }
 
     async addCob(itm: PixRequest<CobPutRequest>): Promise<CobPutResponse> {
@@ -98,33 +134,47 @@ export class PSP {
     }
 
     async addCobR(itm: PixRequest<CobRPutRequest>): Promise<CobRPutResponse> {
+        const rec: RecGetResponse = await this.rec?.read(itm.IdOwner, { idRec: itm.data.idRec });
 
+        if (!rec) {
+            throw new BadRequestException({ idRec: 'O campo $$ não corresponde a uma recorrência existente.' });
+        }
+        if ([StatusRec.Cancelada, StatusRec.Rejeitada, StatusRec.Expirada].includes(rec.status)) {
+            throw new BadRequestException({ idRec: `O campo $$ corresponde a uma recorrência com status ${rec.status}.` });
+        }
 
-        return null;
+        const data = {
+            ...itm.data,
+            valor: itm.data.valor?.original ? itm.data.valor : { original: rec.valor.valorRec },
+            politicaRetentativa: rec.politicaRetentativa,
+            tentativas: [] as TentativaCobR[]
+        };
+        return (await this._addCob({ ...itm, data }, TipoCob.recorrencia)) as CobRPutResponse;
     }
 
     async addCobV(itm: PixRequest<CobVPutRequest>): Promise<CobVPutResponse> {
         return (await this._addCob(itm, TipoCob.vencimento)) as CobVPutResponse;
     }
 
-    async _readCob<T extends CobGetResponse | CobVGetResponse>(key: PixKey, revisao?: number): Promise<T> {
+    async _readCob<T extends AnyCobGetResponse>(key: PixKey, revisao?: number, tipoCob: TipoCob = TipoCob.imediato): Promise<T> {
 
-        const last = () => this.cob.read(key.IdOwner, { txid: key.txid });
+        const last = () => this.collection(tipoCob).read(key.IdOwner, { txid: key.txid });
         const hist = () => this.transHist.read(key.IdOwner, { id: getMD5Hash(key.txid, revisao) });
 
         const curr = revisao ? (await hist()) || (await last()) : (await last());
         if (!curr) { return undefined }
 
-        const c = await this.correntistas.read("DEV", { chave: curr.chave });
-        if (!c) { throw new Error(MESSAGES.Errors.defaults.NOT_FOUNT('Correntista')) }
-
+        if (curr.chave) {
+            const c = await this.correntistas.read("DEV", { chave: curr.chave });
+            if (!c) { throw new NotFoundException(MESSAGES.Errors.defaults.NOT_FOUNT('Correntista')) }
+        }
 
         const loccob = await this.loccob.read(key.IdOwner, { txid: curr.txid });
         let loc: LocGetResponse = undefined;
 
         if (loccob) {
             loc = await this.locations.read(key.IdOwner, { id: loccob.id });
-            if (!loc) { throw new Error(MESSAGES.Errors.defaults.NOT_FOUNT('Location')) }
+            if (!loc) { throw new NotFoundException(MESSAGES.Errors.defaults.NOT_FOUNT('Location')) }
             loc.location = `pix.example.com/qr/${loc.uuid}`
         }
 
@@ -145,56 +195,58 @@ export class PSP {
         return await this._readCob(key, revisao);
     }
 
-    async _listCob(filter: (CobGetFilter | CobVGetFilter) & { IdOwner: string }): Promise<IPaginator & { cobs: (CobGetResponse | CobVGetResponse)[] }> {
-        const res: IPaginator = {
-            parametros: {
-                inicio: filter.inicio,
-                fim: filter.fim,
-                paginacao: {
-                    paginaAtual: filter.paginacao?.paginaAtual || 0,
-                    itensPorPagina: filter.paginacao?.itensPorPagina || 100,
-                    quantidadeDePaginas: 0,
-                    quantidadeTotalDeItens: 0
-                }
-            }
+    async readCobR(key: PixKey, revisao?: number): Promise<CobRGetResponse> {
+        return await this._readCob(key, revisao, TipoCob.recorrencia);
+    }
+
+    async _listCob(filter: AnyCobGetFilter & { IdOwner: string }, tipoCob: TipoCob = TipoCob.imediato): Promise<IPaginator & { cobs: AnyCobGetResponse[] }> {
+        const empty = () => {
+            const { parametros } = this.paginate(filter, []);
+            return { parametros, cobs: [] };
         };
 
         let chave: string = undefined;
+        let idRecs: string[] = undefined;
+        const documento = filter.cnpj || filter.cpf;
 
-        if (filter.cnpj || filter.cpf) {
-            const correntista = await this.correntistas.read("DEV", { cpfcnpj: filter.cnpj || filter.cpf })
+        if (documento && tipoCob === TipoCob.recorrencia) {
+            //COBR NÃO POSSUI CHAVE: FILTRA PELO DEVEDOR DA RECORRÊNCIA VINCULADA
+            const recs: RecGetResponse[] = await this.rec.list(filter.IdOwner);
+            idRecs = recs.filter(r => r.vinculo?.devedor?.cpf === documento || r.vinculo?.devedor?.cnpj === documento).map(r => r.idRec);
+        }
+        else if (documento) {
+            const correntista = await this.correntistas.read("DEV", { cpfcnpj: documento })
 
             //CORRENTISTA NÃO ENCONTRADO RETORNA LISTA VAZIA
             if (!correntista) {
-                return { ...res, cobs: [] }
+                return empty();
             }
             else {
                 chave = correntista.chave
             }
         }
 
-        const ls = await this.cob.list(filter.IdOwner);
+        const idRec = (filter as CobRGetFilter).idRec;
+        const ls = await this.collection(tipoCob).list(filter.IdOwner);
 
         let cobs = await Promise.all(
-            ls.filter((f: any) => {
-                const [criacao, inicio, fim] = [new Date(f.criacao), new Date(filter.inicio), new Date(filter.fim)]
-                return criacao >= inicio && criacao <= fim && (!chave || f.chave === chave)
-            })
-                .map<Promise<CobGetResponse | CobVGetResponse>>(m => this._readCob({ IdOwner: filter.IdOwner, txid: m.txid }))
+            ls.filter((f: any) =>
+                this.inPeriod(f.criacao, filter) &&
+                (!chave || f.chave === chave) &&
+                (!filter.status || f.status === filter.status) &&
+                (!idRecs || idRecs.includes(f.idRec)) &&
+                (!idRec || f.idRec === idRec)
+            )
+                .map<Promise<AnyCobGetResponse>>(m => this._readCob({ IdOwner: filter.IdOwner, txid: m.txid }, undefined, tipoCob))
         );
 
         if (filter.locationPresente !== undefined) {
-            cobs = cobs.filter((f: CobGetResponse) => {
-                const res = (!!f.loc?.id && !!filter.locationPresente) || (!f.loc?.id && !filter.locationPresente)
-                return res;
-            });
+            const presente = filter.locationPresente === true || (filter.locationPresente as unknown) === 'true';
+            cobs = cobs.filter((f: AnyCobGetResponse) => (!!f.loc?.id && presente) || (!f.loc?.id && !presente));
         }
 
-        const ini = res.parametros.paginacao.paginaAtual * res.parametros.paginacao.itensPorPagina;
-        const fim = ini + res.parametros.paginacao.itensPorPagina;
-        res.parametros.paginacao.quantidadeDePaginas = Math.ceil(cobs.length / res.parametros.paginacao.itensPorPagina)
-        res.parametros.paginacao.quantidadeTotalDeItens = cobs.length;
-        return { ...res, cobs: cobs.slice(ini, fim) }
+        const { parametros, items } = this.paginate(filter, cobs);
+        return { parametros, cobs: items }
     }
 
     async listCob(filter: CobGetFilter & { IdOwner: string }) {
@@ -205,26 +257,32 @@ export class PSP {
         return await this._listCob(filter)
     }
 
-    async _editCob(itm: PixRequest<CobPatchRequest | CobVPatchRequest>, tipoCob: TipoCob) {
-        const curr = await this._readCob(itm);
+    async listCobR(filter: CobRGetFilter & { IdOwner: string }) {
+        return await this._listCob(filter, TipoCob.recorrencia)
+    }
+
+    async _editCob(itm: PixRequest<CobPatchRequest | CobVPatchRequest | CobRPatchRequest>, tipoCob: TipoCob) {
+        const curr: any = await this._readCob(itm, undefined, tipoCob);
+        const data: any = itm.data;
+        const coll = this.collection(tipoCob);
         let add = false;
 
-        if (!curr || curr.status != Situacao.Ativa) {
+        if (!curr || !this.editableStatus(tipoCob).includes(curr.status)) {
             return null
         }
         else {
-            if (!!itm.data.devedor || !!itm.data.solicitacaoPagador || !!itm.data.valor || !!itm.data.calendario || itm.data.status) {
+            if (!!data.devedor || !!data.dadosDevedor || !!data.solicitacaoPagador || !!data.infoAdicional || !!data.valor || !!data.calendario || data.status) {
                 add = true
             }
 
-            if (itm.data.loc?.id != null) {
+            if (data.loc?.id != null) {
                 const lc = await this.loccob.read(itm.IdOwner, { txid: itm.txid });
 
-                if (lc?.id != itm.data.loc.id) {
-                    await this.loccob.remove(itm.IdOwner, { id: lc.id });
-                    try { await this.joinLocCob(itm.IdOwner, itm.txid, itm.data.loc.id, tipoCob); }
+                if (lc?.id != data.loc.id) {
+                    if (lc) { await this.loccob.remove(itm.IdOwner, { id: lc.id }); }
+                    try { await this.joinLocCob(itm.IdOwner, itm.txid, data.loc.id, tipoCob); }
                     catch (ex) {
-                        await this.loccob.add(itm.IdOwner, { id: lc.id }); //desfaz a exclusão
+                        if (lc) { await this.loccob.add(itm.IdOwner, { id: lc.id, txid: itm.txid }); } //desfaz a exclusão
                         throw ex;
                     }
                 }
@@ -235,16 +293,18 @@ export class PSP {
                 await this.transHist.add(itm.IdOwner, { id: histId, ...curr });
                 curr.revisao++;
 
-                itm.data.valor = {
-                    original: itm.data.valor?.original || curr.valor.original,
-                    modalidadeAlteracao: itm.data.valor?.modalidadeAlteracao || curr.valor.modalidadeAlteracao
-                };
+                data.valor = tipoCob === TipoCob.recorrencia
+                    ? { original: data.valor?.original || curr.valor?.original }
+                    : {
+                        original: data.valor?.original || curr.valor.original,
+                        modalidadeAlteracao: data.valor?.modalidadeAlteracao || curr.valor.modalidadeAlteracao
+                    };
 
-                if (tipoCob === TipoCob.vencimento && itm.data.valor) {
-                    const valor = itm.data.valor as CobVValor;
+                if (tipoCob === TipoCob.vencimento && data.valor) {
+                    const valor = data.valor as CobVValor;
                     const currV = curr.valor as CobVValor;
-                    itm.data.valor = {
-                        ...itm.data.valor,
+                    data.valor = {
+                        ...data.valor,
                         desconto: {
                             data: valor.desconto?.data || currV.desconto.data,
                             modalidade: valor.desconto?.modalidade || currV.desconto.modalidade,
@@ -261,13 +321,13 @@ export class PSP {
                     }
                 }
 
-                await this.cob.update(itm.IdOwner, { txid: itm.txid }, { ...curr, ...itm.data });
+                await coll.update(itm.IdOwner, { txid: itm.txid }, { ...curr, ...data });
             }
             else {
-                await this.cob.patch(itm.IdOwner, { txid: itm.txid }, { loc: curr.loc });
+                await coll.patch(itm.IdOwner, { txid: itm.txid }, { loc: curr.loc });
             }
 
-            return await this._readCob({ IdOwner: itm.IdOwner, txid: itm.txid });
+            return await this._readCob({ IdOwner: itm.IdOwner, txid: itm.txid }, undefined, tipoCob);
         }
     }
 
@@ -279,15 +339,60 @@ export class PSP {
         return (await this._editCob(itm, TipoCob.vencimento)) as CobVPatchResponse;
     }
 
-    async _removeCob(key: PixID & { IdOwner: string }): Promise<boolean> {
+    async editCobR(itm: PixRequest<CobRPatchRequest>): Promise<CobRPatchResponse> {
+        return (await this._editCob(itm, TipoCob.recorrencia)) as CobRPatchResponse;
+    }
+
+    async retentativaCobR(key: PixKey, dataLiquidacao: string): Promise<CobRGetResponse> {
+        const parsed = new Date(`${dataLiquidacao}T00:00:00.000Z`);
+        if (!DATE_PATTERN.test(dataLiquidacao || '') || isNaN(+parsed)) {
+            throw new BadRequestException({ data: 'O campo $$ não respeita o schema.' });
+        }
+
+        const curr: CobRGetResponse = await this.cobR.read(key.IdOwner, { txid: key.txid });
+        if (!curr) {
+            throw new NotFoundException();
+        }
+
+        const rec: RecGetResponse = await this.rec?.read(key.IdOwner, { idRec: curr.idRec });
+        if (!rec || rec.politicaRetentativa !== PoliticaRetentativa.Permite) {
+            throw new BadRequestException('A recorrência vinculada à cobrança não permite retentativas.');
+        }
+
+        if (!this.editableStatus(TipoCob.recorrencia).includes(curr.status)) {
+            throw new BadRequestException(`A cobrança recorrente com status ${curr.status} não admite retentativas.`);
+        }
+
+        const tentativas = curr.tentativas || [];
+        if (tentativas.filter(f => f.tipo === TipoTentativaCobR.Retentativa).length >= MAX_RETENTATIVAS) {
+            throw new BadRequestException(`O limite de ${MAX_RETENTATIVAS} retentativas foi atingido.`);
+        }
+
+        const hoje = new Date(new Date().toJSON().substring(0, 10) + 'T00:00:00.000Z');
+        const vencimento = new Date(`${curr.calendario?.dataDeVencimento?.substring(0, 10)}T00:00:00.000Z`);
+        const limite = new Date(+vencimento + JANELA_RETENTATIVA_DIAS * 86400000);
+        if (parsed < hoje || (!isNaN(+limite) && parsed > limite)) {
+            throw new BadRequestException({ data: `O campo $$ deve estar entre a data atual e ${JANELA_RETENTATIVA_DIAS} dias após o vencimento.` });
+        }
+
+        const tentativa: TentativaCobR = { tipo: TipoTentativaCobR.Retentativa, dataLiquidacao, status: "SOLICITADA", criacao: new Date().toJSON() };
+        await this.cobR.patch(key.IdOwner, { txid: key.txid }, { tentativas: [...tentativas, tentativa] });
+
+        return await this.readCobR(key);
+    }
+
+    async _removeCob(key: PixID & { IdOwner: string }, tipoCob: TipoCob = TipoCob.imediato): Promise<boolean> {
         await this.loccob.remove(key.IdOwner, { txid: key.txid });
-        return await this.cob.remove(key.IdOwner, { txid: key.txid });
+        return await this.collection(tipoCob).remove(key.IdOwner, { txid: key.txid });
     }
     async removeCob(key: PixID & { IdOwner: string }): Promise<boolean> {
         return this._removeCob(key);
     }
     async removeCobV(key: PixID & { IdOwner: string }): Promise<boolean> {
         return this._removeCob(key);
+    }
+    async removeCobR(key: PixID & { IdOwner: string }): Promise<boolean> {
+        return this._removeCob(key, TipoCob.recorrencia);
     }
 
     async readLoc({ IdOwner, id }: LocID & { IdOwner: string }): Promise<LocGetResponse> {
@@ -297,7 +402,6 @@ export class PSP {
             return { ...itm, ...(lc?.txid ? { txid: lc?.txid } : {}), location: `pix.example.com/qr/${itm.uuid}` }
         }
     }
-
     async listLoc(filter: LocGetFilter & { IdOwner: string }) {
 
         const res = {
@@ -370,16 +474,58 @@ export class PSP {
         return await this.loccob.remove(IdOwner, { id });
     }
 
-    async addRec(mdl: RecRequest<RecPostRequest>) {
+    async addRec(mdl: RecRequest<RecPostRequest>): Promise<RecGetResponse> {
 
-        const own =  owners.find( f=> f.id === mdl.IdOwner )   
+        const own = owners.find(f => f.id === mdl.IdOwner)
 
-        if(!own){
-            throw new Error( MESSAGES.Errors.defaults.NOT_FOUNT('OWNER') );
+        if (!own) {
+            throw new NotFoundException(MESSAGES.Errors.defaults.NOT_FOUNT('OWNER'));
         }
 
-        const itm = { ...mdl.data, idRec: `R${mdl.data.politicaRetentativa === PoliticaRetentativa.NaoPermite ? 'N' : 'R'}${ own.ISPB }${ new Date().toJSON().replace(/\D/g,'').substring(0,8) } `    }
+        const ispb = (own.ISPB || own.id.replace(/\W/g, '')).substring(0, 8);
+        const data = new Date().toJSON().replace(/\D/g, '').substring(0, 8);
+        const sufixo = randomUUID().replace(/\-/g, '').substring(0, 11);
+        const idRec = `R${mdl.data.politicaRetentativa === PoliticaRetentativa.NaoPermite ? 'N' : 'R'}${ispb}${data}${sufixo}`;
+
+        const itm: RecGetResponse = { ...mdl.data, idRec, status: StatusRec.Criada, atualizacao: [{ status: StatusRec.Criada, data: new Date().toJSON() }] };
         return await this.rec.add(mdl.IdOwner, itm);
     }
-}
 
+    async readRec({ IdOwner, idRec }: { IdOwner: string, idRec: string }): Promise<RecGetResponse> {
+        return await this.rec.read(IdOwner, { idRec });
+    }
+
+    async listRec(filter: RecGetFilter & { IdOwner: string }) {
+        const documento = filter.cpf || filter.cnpj;
+        const recs: RecGetResponse[] = (await this.rec.list(filter.IdOwner)).filter((f: RecGetResponse) =>
+            this.inPeriod(f.atualizacao?.[0]?.data, filter) &&
+            (!filter.status || f.status === filter.status) &&
+            (!documento || f.vinculo?.devedor?.cpf === documento || f.vinculo?.devedor?.cnpj === documento)
+        );
+
+        const { parametros, items } = this.paginate(filter, recs);
+        return { parametros, recs: items };
+    }
+
+    async editRec({ IdOwner, idRec, data }: RecRequest<RecPatchRequest> & { idRec: string }): Promise<RecGetResponse> {
+        const curr: RecGetResponse = await this.rec.read(IdOwner, { idRec });
+        if (!curr) {
+            return undefined;
+        }
+
+        if ([StatusRec.Cancelada, StatusRec.Rejeitada, StatusRec.Expirada].includes(curr.status)) {
+            throw new BadRequestException(`A recorrência com status ${curr.status} não pode ser alterada.`);
+        }
+
+        const atualizacao = data.status && data.status !== curr.status
+            ? [...(curr.atualizacao || []), { status: data.status, data: new Date().toJSON() }]
+            : curr.atualizacao;
+
+        return await this.rec.patch(IdOwner, { idRec }, {
+            ...(data.status ? { status: data.status } : {}),
+            ...(data.valor ? { valor: { ...curr.valor, ...data.valor } } : {}),
+            ...(data.ativacao ? { ativacao: data.ativacao } : {}),
+            atualizacao
+        });
+    }
+}

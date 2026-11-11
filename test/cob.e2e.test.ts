@@ -333,7 +333,7 @@ describe('COB', () => {
 
       it('Não cadastrado', async () => {
         await request(app.getHttpServer())
-          .patch(`/cob/${randomUUID()}`)
+          .patch(`/cob/${randomUUID().replace(/\-/g, '')}`)
           .send({ valor: { original: "2.00" } })
           .set("mocked-token", "123-abc")
           .expect(404)
